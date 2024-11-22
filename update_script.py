@@ -1,101 +1,90 @@
 import requests
-import re
 import os
 from collections import defaultdict
+import re
 
 DOCKERHUB_REPO = "library/nextcloud"
-VERSION_REGEX = re.compile(r"((28|29|([3-9][0-9]))([.0-9]*)-)?apache")
+GITHUB_USERNAME = "maximilian1001"
+GITHUB_REPO = "docker-all-nextcloud-smb"
+TAG_FILTER_REGEX = r"((28|29|([3-9][0-9]))([.0-9]*)-)?apache"
 
-
-def fetch_dockerhub_digests():
-    """Ruft alle amd64-Digests von Docker Hub ab und sortiert sie nach Tags."""
-    url = f"https://registry.hub.docker.com/v2/repositories/{DOCKERHUB_REPO}/tags?page_size=100"
-    all_digests = defaultdict(list)
-
+def fetch_dockerhub_images():
+    """Fetch all amd64 images from Docker Hub, grouped by digest."""
+    url = f"https://registry.hub.docker.com/v2/repositories/{DOCKERHUB_REPO}/tags"
+    params = {"page_size": 100}
+    images_by_digest = defaultdict(list)
+    
+    print("Fetching images from Docker Hub...")
+    
     while url:
-        response = requests.get(url)
+        response = requests.get(url, params=params)
         if response.status_code != 200:
-            print(f"Fehler beim Abrufen der Daten: {response.status_code}")
-            break
+            print(f"Error fetching Docker Hub tags: {response.status_code}")
+            return {}
 
         data = response.json()
-        for tag_info in data.get("results", []):
-            tag_name = tag_info["name"]
+        for result in data.get("results", []):
+            tag_name = result["name"]
 
-            # Regex-Filterung der relevanten Tags
-            if not VERSION_REGEX.fullmatch(tag_name):
+            # Filter tags based on the regex
+            if not re.match(TAG_FILTER_REGEX, tag_name):
                 continue
 
-            # Suche nach amd64-Digest
-            amd64_image = next(
-                (image for image in tag_info["images"] if image["architecture"] == "amd64"),
-                None
-            )
-            if amd64_image:
-                digest = amd64_image["digest"]
-                all_digests[digest].append(tag_name)
+            # Search for amd64 architecture in images
+            for image in result.get("images", []):
+                if image["architecture"] == "amd64":
+                    digest = image["digest"]
+                    images_by_digest[digest].append(tag_name)
+                    break
 
-        # Nächste Seite abrufen, falls vorhanden
+        # Next page URL for pagination
         url = data.get("next")
 
-    return all_digests
+    print(f"Found {len(images_by_digest)} unique amd64 digests.")
+    return images_by_digest
 
-
-def fetch_existing_ghcr_digests():
-    """Ruft alle Digests von GHCR ab."""
+def build_and_push_images(images_by_digest):
+    """Build and push Docker images grouped by digest."""
     headers = {
         "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
         "Accept": "application/vnd.github.v3+json"
     }
-    url = f"https://ghcr.io/v2/{GITHUB_USERNAME}/docker-all-nextcloud-smb/tags/list"
-    response = requests.get(url, headers=headers)
 
-    if response.status_code != 200:
-        print(f"Fehler beim Abrufen der GHCR-Tags: {response.status_code}")
-        return set()
-
-    tags = response.json().get("tags", [])
-    existing_digests = set()
-
-    for tag in tags:
-        # Manifeste abrufen, um den Digest zu finden
-        manifest_url = f"https://ghcr.io/v2/{GITHUB_USERNAME}/docker-all-nextcloud-smb/manifests/{tag}"
-        manifest_response = requests.get(manifest_url, headers=headers)
-        if manifest_response.status_code == 200:
-            description = manifest_response.json().get("description", "")
-            if "Original Digest:" in description:
-                original_digest = description.split("Original Digest:")[1].strip()
-                existing_digests.add(original_digest)
-
-    return existing_digests
-
-
-def main():
-    dockerhub_digests = fetch_dockerhub_digests()
-    ghcr_digests = fetch_existing_ghcr_digests()
-
-    # Finde Digests, die gebaut werden müssen
-    digests_to_build = {
-        digest: tags for digest, tags in dockerhub_digests.items()
-        if digest not in ghcr_digests
-    }
-
-    print("Neue Images, die gebaut werden müssen:")
-    for digest, tags in digests_to_build.items():
-        print(f"Digest: {digest}")
+    for digest, tags in images_by_digest.items():
+        print(f"Building image for digest: {digest}")
         print(f"Tags: {', '.join(tags)}")
 
-    # Baue und pushe Images
-    for digest, tags in digests_to_build.items():
-        for tag in tags:
-            print(f"Baue und pushe Image für Tag: {tag}, Digest: {digest}")
-            os.system(
-                f"docker build --build-arg BASE_IMAGE_DIGEST={digest} -t ghcr.io/{GITHUB_USERNAME}/docker-all-nextcloud-smb:{tag} ."
-            )
-            os.system(
-                f"docker push ghcr.io/{GITHUB_USERNAME}/docker-all-nextcloud-smb:{tag}"
-            )
+        # Modify the Dockerfile to include the original digest in the description
+        with open("Dockerfile", "w") as dockerfile:
+            dockerfile.write(f"""
+            FROM nextcloud:{tags[0]}
 
+            RUN apt-get update && apt-get install -y smbclient libsmbclient-dev
+            RUN pecl install smbclient
+            RUN echo "extension=smbclient.so" >> /usr/local/etc/php/conf.d/nextcloud.ini
+            """)
+
+        # Build the Docker image
+        image_name = f"ghcr.io/{GITHUB_USERNAME}/{GITHUB_REPO}:{tags[0]}"
+        build_command = f"docker build -t {image_name} ."
+        print(f"Running build command: {build_command}")
+        os.system(build_command)
+
+        # Push the Docker image
+        for tag in tags:
+            full_image_name = f"ghcr.io/{GITHUB_USERNAME}/{GITHUB_REPO}:{tag}"
+            os.system(f"docker tag {image_name} {full_image_name}")
+            push_command = f"docker push {full_image_name}"
+            print(f"Pushing image: {full_image_name}")
+            os.system(push_command)
+
+def main():
+    images_by_digest = fetch_dockerhub_images()
+    if not images_by_digest:
+        print("No images found to build.")
+        return
+
+    build_and_push_images(images_by_digest)
 
 if __name__ == "__main__":
     main()
