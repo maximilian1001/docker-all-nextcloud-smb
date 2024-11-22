@@ -42,6 +42,16 @@ def build_and_push_images(new_versions):
         os.system(f"docker build . -t {GHCR_REPO}:{version} --build-arg VERSION={version}")
         os.system(f"docker push {GHCR_REPO}:{version}")
 
+    # Cleanup nach jedem erfolgreichen Push
+        print(f"Cleaning up local Docker artifacts for version: {version}")
+        try:
+            # Löscht das lokal gebaute Image
+            subprocess.run(f"docker rmi {GHCR_REPO}:{version}", shell=True, check=True)
+            # Löscht ungenutzte Docker-Objekte (Caches, unbenutzte Layer usw.)
+            subprocess.run("docker system prune -af", shell=True, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Error during cleanup for version {version}: {e}")
+
 if __name__ == "__main__":
     nextcloud_versions = get_nextcloud_versions()
     existing_versions = get_existing_ghcr_versions()
