@@ -1,107 +1,106 @@
 import requests
-import os
 import re
-import subprocess
 from collections import defaultdict
 
+DOCKERHUB_URL = "https://registry.hub.docker.com/v2/repositories/library/nextcloud/tags"
+REGEX = re.compile(r"^((28|29|([3-9][0-9]))([.0-9]*)-)?apache$")
+HEADERS = {"Accept": "application/json"}
 GITHUB_USERNAME = "maximilian1001"
-GHCR_REPO = f"ghcr.io/{GITHUB_USERNAME}/docker-all-nextcloud-smb"
-VERSION_REGEX = r"((([3-9][0-9]))([.0-9]*)-)?apache"
+REPO_NAME = "docker-all-nextcloud-smb"
 
-def fetch_dockerhub_tags_and_digests():
-    """Ruft alle Tags und zugehörigen Digests von Docker Hub ab und gruppiert sie nach Digest."""
-    url = "https://registry.hub.docker.com/v2/repositories/library/nextcloud/tags?page_size=100"
-    grouped_tags = defaultdict(list)
+def fetch_dockerhub_tags():
+    """Fetches DockerHub tags and filters by amd64 and regex."""
+    page = 1
+    tags_by_digest = defaultdict(list)
+    print("Fetching DockerHub tags...")
 
-    while url:
-        response = requests.get(url)
-        response.raise_for_status()
+    while True:
+        response = requests.get(f"{DOCKERHUB_URL}?page={page}&page_size=100", headers=HEADERS)
+        if response.status_code != 200:
+            print(f"Error fetching DockerHub tags: {response.status_code}")
+            break
+
         data = response.json()
+        for result in data.get("results", []):
+            tag_name = result.get("name", "")
+            if not REGEX.match(tag_name):
+                continue
 
-        for result in data["results"]:
-            tag = result["name"]
-            digest = result["digest"]
-            if re.match(VERSION_REGEX, tag):
-                grouped_tags[digest].append(tag)
+            # Find amd64 image
+            amd64_digest = None
+            for image in result.get("images", []):
+                if image.get("architecture") == "amd64":
+                    amd64_digest = image.get("digest")
+                    break
 
-        url = data.get("next")
-    return grouped_tags
+            if amd64_digest:
+                tags_by_digest[amd64_digest].append(tag_name)
+
+        # Check for next page
+        if not data.get("next"):
+            break
+        page += 1
+
+    print(f"Fetched {len(tags_by_digest)} digests with matching tags.")
+    return tags_by_digest
+
 
 def fetch_existing_ghcr_digests():
-    """Ruft alle Digests von GHCR ab."""
-    url = f"https://ghcr.io/v2/{GITHUB_USERNAME}/docker-all-nextcloud-smb/tags/list"
-    headers = {"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}"}
+    """Fetch existing digests from GHCR."""
+    url = f"https://ghcr.io/v2/{GITHUB_USERNAME}/{REPO_NAME}/tags/list"
+    headers = {
+        "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+        "Accept": "application/vnd.github.v3+json"
+    }
     response = requests.get(url, headers=headers)
-    if response.status_code != 200:
+
+    if response.status_code == 403:
+        print("Error: Access to GHCR denied. Check your token permissions.")
+        return set()
+    elif response.status_code != 200:
         print(f"Error fetching GHCR tags: {response.status_code}")
         return set()
 
     tags = response.json().get("tags", [])
-    existing_digests = set()
+    print(f"Fetched {len(tags)} existing tags from GHCR.")
+    return set(tags)
 
-    for tag in tags:
-        manifest_url = f"https://ghcr.io/v2/{GITHUB_USERNAME}/docker-all-nextcloud-smb/manifests/{tag}"
-        response = requests.get(manifest_url, headers=headers)
-        if response.status_code == 200:
-            description = response.json().get("description", "")
-            if "Original Digest:" in description:
-                original_digest = description.split("Original Digest:")[1].strip()
-                existing_digests.add(original_digest)
 
-    return existing_digests
+def build_and_push_images(tags_by_digest, existing_tags):
+    """Build and push images for new digests."""
+    new_digests = {digest: tags for digest, tags in tags_by_digest.items() if not any(tag in existing_tags for tag in tags)}
+    print(f"New digests to process: {len(new_digests)}")
 
-def build_and_push_by_digest(grouped_tags, existing_digests):
-    """Baut Images für neue Digests und pusht sie unter allen zugehörigen Tags."""
-    for digest, tags in grouped_tags.items():
-        if digest in existing_digests:
-            print(f"Skipping Digest {digest}, already exists in GHCR.")
-            continue
+    for digest, tags in new_digests.items():
+        print(f"Building image for digest: {digest} with tags: {tags}")
+        # Write Dockerfile
+        with open("Dockerfile", "w") as dockerfile:
+            dockerfile.write(f"FROM nextcloud:{tags[0]}\n")
+            dockerfile.write("RUN apt-get update && apt-get install -y smbclient libsmbclient-dev\n")
+            dockerfile.write("RUN pecl install smbclient\n")
+            dockerfile.write("RUN echo \"extension=smbclient.so\" >> /usr/local/etc/php/conf.d/nextcloud.ini\n")
 
-        print(f"\nBuilding and pushing image for Digest: {digest}")
-        try:
-            # Docker-Build-Befehl
-            subprocess.run(
-                f"docker build . -t {GHCR_REPO}:{tags[0]} --build-arg VERSION={tags[0]}",
-                shell=True,
-                check=True,
-            )
+        # Build and push for each tag
+        for tag in tags:
+            image_name = f"ghcr.io/{GITHUB_USERNAME}/{REPO_NAME}:{tag}"
+            print(f"Building and pushing {image_name}...")
+            os.system(f"docker build -t {image_name} .")
+            os.system(f"docker push {image_name}")
 
-            # Push für jeden Tag
-            for tag in tags:
-                print(f"Pushing tag: {tag}")
-                subprocess.run(
-                    f"docker tag {GHCR_REPO}:{tags[0]} {GHCR_REPO}:{tag}",
-                    shell=True,
-                    check=True,
-                )
-                subprocess.run(
-                    f"docker push {GHCR_REPO}:{tag} --description 'Original Digest: {digest}'",
-                    shell=True,
-                    check=True,
-                )
+            # Annotate image with digest information
+            os.system(f"docker buildx imagetools inspect {image_name} --annotations 'org.opencontainers.image.description=Original Digest: {digest}'")
 
-        except subprocess.CalledProcessError as e:
-            print(f"Error during build or push for Digest {digest}: {e}")
-            continue
+        # Clean up Docker artifacts
+        os.system("docker system prune -af")
 
-        # Cleanup nach jedem erfolgreichen Push
-        print(f"Cleaning up local Docker artifacts for Digest: {digest}")
-        try:
-            # Löscht das lokal gebaute Image
-            subprocess.run(f"docker rmi {GHCR_REPO}:{tags[0]}", shell=True, check=True)
-            subprocess.run("docker system prune -af", shell=True, check=True)
-        except subprocess.CalledProcessError as e:
-            print(f"Error during cleanup for Digest {digest}: {e}")
+    print("All images built and pushed successfully.")
+
+
+def main():
+    tags_by_digest = fetch_dockerhub_tags()
+    existing_tags = fetch_existing_ghcr_digests()
+    build_and_push_images(tags_by_digest, existing_tags)
+
 
 if __name__ == "__main__":
-    print("Fetching Docker Hub tags and digests...")
-    grouped_tags = fetch_dockerhub_tags_and_digests()
-    print(f"Found {len(grouped_tags)} unique digests matching the criteria.")
-
-    print("Fetching existing GHCR digests...")
-    existing_digests = fetch_existing_ghcr_digests()
-    print(f"Found {len(existing_digests)} digests already in GHCR.")
-
-    print("\nStarting build and push process...")
-    build_and_push_by_digest(grouped_tags, existing_digests)
-    print("Process complete.")
+    main()
