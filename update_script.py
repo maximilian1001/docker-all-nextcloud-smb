@@ -1,9 +1,13 @@
 import requests
 import subprocess
 import os
+import re
 
 GITHUB_USERNAME = "maximilian1001"
 GHCR_REPO = f"ghcr.io/{GITHUB_USERNAME}/docker-all-nextcloud-smb"
+
+# Regulärer Ausdruck für die Versionsfilterung
+VERSION_REGEX = r"((28|29|([3-9][0-9]))([.0-9]*)-)?apache"
 
 def get_nextcloud_versions():
     """Ruft alle verfügbaren Nextcloud-Versionen von Docker Hub ab."""
@@ -14,7 +18,7 @@ def get_nextcloud_versions():
         data = response.json()
         for result in data["results"]:
             tag = result["name"]
-            if tag.startswith("30") and tag.endswith("apache"):
+            if re.match(VERSION_REGEX, tag):
                 versions.append(tag)
         url = data.get("next")
     return versions
