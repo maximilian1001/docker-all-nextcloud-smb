@@ -14,7 +14,7 @@ def get_nextcloud_versions():
         data = response.json()
         for result in data["results"]:
             tag = result["name"]
-            if ("apache" in tag && "30" in tag):  # Nur Apache-Version 30 berücksichtigen
+            if ("apache" in tag & "30" in tag):  # Nur Apache-Version 30 berücksichtigen
                 versions.append(tag)
         url = data.get("next")
     return versions
