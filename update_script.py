@@ -6,7 +6,7 @@ import re
 DOCKERHUB_REPO = "library/nextcloud"
 GITHUB_USERNAME = "maximilian1001"
 GITHUB_REPO = "docker-all-nextcloud-smb"
-TAG_FILTER_REGEX = r"((28|29|([3-9][0-9]))([.0-9]*)-)?apache"
+TAG_FILTER_REGEX = r"(((27|28|29|([3-9][0-9]))-)apache)"
 
 def fetch_dockerhub_images():
     """Fetch all amd64 images from Docker Hub, grouped by digest."""
