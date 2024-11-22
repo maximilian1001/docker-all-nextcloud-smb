@@ -53,14 +53,25 @@ def build_and_push_images(new_versions):
             print(f"Error during cleanup for version {version}: {e}")
 
 if __name__ == "__main__":
+    print("Fetching Nextcloud versions from Docker Hub...")
     nextcloud_versions = get_nextcloud_versions()
+    print(f"Found {len(nextcloud_versions)} tags on Docker Hub.")
+
+    print("Fetching existing versions from GitHub Container Registry...")
     existing_versions = get_existing_ghcr_versions()
+    print(f"Found {len(existing_versions)} tags in GHCR.")
 
     # Nur neue Versionen filtern
     new_versions = [v for v in nextcloud_versions if v not in existing_versions]
 
+    # Ausgabe der neuen Versionen
     if new_versions:
-        print(f"New versions to build: {new_versions}")
+        print("\nNew versions to build:")
+        for version in new_versions:
+            print(f"- {version}")
+        print(f"\nTotal new versions to build: {len(new_versions)}")
+
+        # Build- und Push-Prozess starten
         build_and_push_images(new_versions)
     else:
-        print("No new versions found.")
+        print("\nNo new versions found. Nothing to build.")
