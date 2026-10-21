@@ -2,33 +2,203 @@ name: Build and Push to GHCR
 
 on:
   schedule:
-    - cron: '0 2 * * *'  # Täglich um 2:00 Uhr
-  workflow_dispatch:  # Manuelles Triggern
+    - cron: '17 3 * * *'   # daily: build new or changed upstream digests
+    - cron: '43 4 * * 0'   # Sunday: also rebuild the newest image of every major (OS updates)
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: 'Only build these upstream tags (comma separated, e.g. 31.0.14-apache,34-apache)'
+        type: string
+        default: ''
+      force:
+        description: 'Rebuild every image in range (30 .. stable)'
+        type: boolean
+        default: false
+      dry_run:
+        description: 'Only show the build matrix, do not build or push'
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/**'
+      - '.github/scripts/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/maximilian1001/docker-all-nextcloud-smb
+  PACKAGE: docker-all-nextcloud-smb
+  WEEKLY_CRON: '43 4 * * 0'
 
 jobs:
-  build:
+  discover:
+    name: Discover upstream tags
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      matrix: ${{ steps.discover.outputs.matrix }}
+      count: ${{ steps.discover.outputs.count }}
     steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+      - name: Discover
+        id: discover
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          INPUT_TAGS: ${{ inputs.tags }}
+          INPUT_FORCE: ${{ inputs.force }}
+        run: |
+          args=()
+          if [ "$EVENT" = "pull_request" ]; then
+            # PRs only test-build the stable image, nothing is pushed.
+            args+=(--tags stable-apache)
+          elif [ -n "$INPUT_TAGS" ]; then
+            args+=(--tags "$INPUT_TAGS")
+          fi
+          if [ "$INPUT_FORCE" = "true" ]; then args+=(--force); fi
+          if [ "$SCHEDULE" = "$WEEKLY_CRON" ]; then args+=(--rebuild-latest); fi
+          python3 .github/scripts/discover.py --image "$IMAGE" "${args[@]}"
 
-    - name: Log in to GitHub Container Registry
-      uses: docker/login-action@v2
-      with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+  build:
+    name: ${{ matrix.tag }}
+    needs: discover
+    if: ${{ needs.discover.outputs.count != '0' && !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    env:
+      PUSH: ${{ github.event_name != 'pull_request' }}
+      TEST_IMAGE: nextcloud-smb:test
+    steps:
+      - uses: actions/checkout@v4
 
-    - name: Install Python Dependencies
-      run: |
-        python3 -m pip install requests
+      - uses: docker/setup-buildx-action@v3
 
-    - name: Run Update Script
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        python3 update_script.py
+      - name: Log in to GHCR
+        if: env.PUSH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          tags: ${{ env.TEST_IMAGE }}
+          build-args: |
+            BASE=docker.io/library/nextcloud@${{ matrix.digest }}
+          labels: |
+            org.opencontainers.image.base.name=docker.io/library/nextcloud:${{ matrix.tag }}
+            org.opencontainers.image.base.digest=${{ matrix.digest }}
+            org.opencontainers.image.version=${{ matrix.tag }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          # Rebuilds of an unchanged base must not come from cache, otherwise
+          # the weekly run would not pick up Debian security updates.
+          no-cache: ${{ matrix.reason == 'weekly rebuild' || matrix.reason == 'force' || matrix.reason == 'requested' }}
+          cache-from: type=gha,scope=nextcloud-${{ matrix.major }}
+          cache-to: type=gha,mode=min,scope=nextcloud-${{ matrix.major }}
+
+      - name: Smoke test
+        id: test
+        run: |
+          run_php() { docker run --rm --entrypoint php "$TEST_IMAGE" "$@"; }
+          run_php -m | grep -qix smbclient
+          run_php -r 'exit(function_exists("smbclient_state_new") ? 0 : 1);'
+          php_version=$(run_php -r 'echo PHP_VERSION;')
+          smb_version=$(run_php -r 'echo phpversion("smbclient");')
+          nc_version=$(run_php -r 'require "/usr/src/nextcloud/version.php"; echo $OC_VersionString;')
+          echo "Nextcloud $nc_version, PHP $php_version, smbclient $smb_version"
+          {
+            echo "php=$php_version"
+            echo "smb=$smb_version"
+            echo "nc=$nc_version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Push tags
+        if: env.PUSH == 'true'
+        env:
+          TAGS: ${{ matrix.tags }}
+          PRIMARY: ${{ matrix.tag }}
+          DIGEST: ${{ matrix.digest }}
+        run: |
+          IFS=, read -ra tags <<< "$TAGS"
+          for t in "${tags[@]}"; do
+            docker tag "$TEST_IMAGE" "$IMAGE:$t"
+            docker push --quiet "$IMAGE:$t"
+          done
+          label=$(docker buildx imagetools inspect "$IMAGE:$PRIMARY" \
+            --format '{{ index .Image.Config.Labels "org.opencontainers.image.base.digest" }}')
+          echo "Published $IMAGE:$PRIMARY with base.digest=$label"
+          [ "$label" = "$DIGEST" ]
+
+      - name: Job summary
+        if: always()
+        env:
+          TAGS: ${{ matrix.tags }}
+          DIGEST: ${{ matrix.digest }}
+          REASON: ${{ matrix.reason }}
+          NC: ${{ steps.test.outputs.nc }}
+          PHP: ${{ steps.test.outputs.php }}
+          SMB: ${{ steps.test.outputs.smb }}
+          RESULT: ${{ job.status }}
+        run: |
+          {
+            echo "| Tags | Base digest (amd64) | Nextcloud | PHP | smbclient | Pushed | Reason | Status |"
+            echo "|---|---|---|---|---|---|---|---|"
+            echo "| ${TAGS//,/, } | \`${DIGEST:0:19}\` | ${NC:-?} | ${PHP:-?} | ${SMB:-?} | $PUSH | $REASON | $RESULT |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  cleanup:
+    name: Delete untagged versions
+    needs: [discover, build]
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && !inputs.dry_run && needs.discover.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      # Tagged versions are never touched. A few untagged ones are kept so that
+      # deployments pinned to a recently replaced digest (e.g. Docker Swarm
+      # services) can still pull it for a while.
+      - uses: actions/delete-package-versions@v5
+        with:
+          package-name: ${{ env.PACKAGE }}
+          package-type: container
+          delete-only-untagged-versions: 'true'
+          min-versions-to-keep: 10
+
+  keepalive:
+    # GitHub disables scheduled workflows after 60 days without repository
+    # activity. Re-enabling the workflow via the API resets that timer without
+    # creating commits (same approach as gautamkrishnar/keepalive-workflow v2).
+    name: Keep schedule alive
+    if: github.event_name == 'schedule' && github.event.schedule == '43 4 * * 0'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Re-enable workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/build.yml/enable"
