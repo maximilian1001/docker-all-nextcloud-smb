@@ -44,7 +44,7 @@ The workflow [`.github/workflows/build.yml`](.github/workflows/build.yml) runs d
 2. **Build**: one build per upstream digest, based on `nextcloud@sha256:<digest>` (pinned), see [`Dockerfile`](Dockerfile):
    ```bash
    apt-get install -y --no-install-recommends $PHPIZE_DEPS smbclient libsmbclient-dev
-   pecl install smbclient
+   pecl install smbclient-1.2.0dev.tgz   # downloaded from pecl.php.net
    docker-php-ext-enable smbclient
    # build-only packages are removed again, apt lists and pear cache are cleaned
    ```
