@@ -2,8 +2,11 @@
 """Discover which Nextcloud apache images need to be (re)built.
 
 Reads the upstream tags of docker.io/library/nextcloud (linux/amd64 only),
-groups them by their amd64 manifest digest and keeps the groups whose major
-version lies between MIN_MAJOR and the major version `stable-apache` points to.
+groups them by their amd64 manifest digest and keeps, for every major version
+between MIN_MAJOR and the major version `stable-apache` points to, only the
+newest release (the group carrying the `NN-apache` tag, together with its
+`NN.N-apache` / `NN.N.N-apache` aliases). Older minor/patch releases are not
+built.
 For every group it checks the already published image on GHCR: a group is
 built only if one of its tags is missing or carries a different
 `org.opencontainers.image.base.digest` label.
@@ -191,9 +194,14 @@ def build_groups(upstream: dict[str, str]):
             continue
         if not MIN_MAJOR <= major <= stable_major:
             continue
+        if f"{major}-apache" not in group.tags:
+            continue  # older minor/patch release of this major
         group.tags.sort(key=tag_sort_key)
         groups.append(group)
     groups.sort(key=lambda g: g.sort_key)
+    missing = sorted(set(range(MIN_MAJOR, stable_major + 1)) - {g.major for g in groups})
+    if missing:
+        raise DiscoverError(f"no upstream NN-apache tag for major(s) {missing}")
     return groups, stable_major
 
 
@@ -297,7 +305,8 @@ def main() -> int:
     unknown = [t for t in requested if t not in tag_to_group]
     if unknown:
         raise DiscoverError(
-            f"requested tags not upstream or out of range {MIN_MAJOR}..{stable_major}: "
+            f"requested tags not upstream, out of range {MIN_MAJOR}..{stable_major} "
+            "or not the newest release of their major: "
             + ", ".join(unknown)
         )
     requested_groups = {id(tag_to_group[t]) for t in requested}

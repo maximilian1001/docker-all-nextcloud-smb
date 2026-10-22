@@ -15,17 +15,19 @@ Now you can access Nextcloud at http://localhost:8080/ from your host system.
 Everything else (volumes, environment variables, cron, upgrades) works exactly as described in the [official documentation](https://github.com/nextcloud/docker).
 
 ## Supported tags
-All official apache tags from major version **30** up to the major version that upstream `stable-apache` currently points to:
+The newest release of every major version from **30** up to the major version that upstream `stable-apache` currently points to,
+published under all of its official apache tags:
 
 | Tag | Meaning |
 |---|---|
 | `NN-apache` (e.g. `34-apache`) | newest release of a major version – **recommended** |
-| `NN.N-apache`, `NN.N.N-apache` | minor / exact patch release |
+| `NN.N-apache`, `NN.N.N-apache` | the same image under its minor / exact patch tag (e.g. `34.0-apache`, `34.0.5-apache`) |
 | `stable-apache`, `production-apache` | same image as upstream `stable-apache` / `production-apache` |
 
 A new major version (e.g. 35) is only added once upstream `stable-apache` points to it.
 `apache` and `latest` are **not** published: upstream they point to the newest major, which is usually newer than stable,
 and they would quickly become stale or flip between majors here.
+Older minor/patch releases of a major are not built (tags published earlier stay on GHCR but are no longer updated).
 fpm and other variants are not built.
 
 > **Upgrades:** Nextcloud can only be upgraded **one major version at a time** (e.g. 32 → 33 → 34).
@@ -39,7 +41,7 @@ with the exact upstream image it was built from.
 The workflow [`.github/workflows/build.yml`](.github/workflows/build.yml) runs daily:
 
 1. **Discover** ([`.github/scripts/discover.py`](.github/scripts/discover.py)): reads all upstream apache tags from Docker Hub,
-   groups them by their linux/amd64 digest and determines the major version of `stable-apache`.
+   groups them by their linux/amd64 digest, determines the major version of `stable-apache` and keeps the newest group (`NN-apache`) of each major.
    A group is built only if one of its tags is missing on GHCR or its `base.digest` label differs from the upstream digest.
 2. **Build**: one build per upstream digest, based on `nextcloud@sha256:<digest>` (pinned), see [`Dockerfile`](Dockerfile):
    ```bash
@@ -52,7 +54,6 @@ The workflow [`.github/workflows/build.yml`](.github/workflows/build.yml) runs d
 4. **Cleanup**: untagged image versions on GHCR are deleted (tagged versions are kept).
 
 On Sundays the newest image of every major version is rebuilt to pick up Debian security updates.
-Historic patch releases are built once and not rebuilt afterwards.
 
 Manual runs (*Actions → Build and Push to GHCR → Run workflow*):
 
